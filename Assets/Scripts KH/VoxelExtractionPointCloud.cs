@@ -1,4 +1,5 @@
 //#define DEBUG_THIS
+//#define GREEDY_MESHING
 //#define JITTER
 #define USE_NORMALS
 #define USE_UV
@@ -74,7 +75,15 @@ public class IndexStack<T>
 public class Quad
 {
 	public int x, y, w, h;
-	public Quad(int _x, int _y, int _w, int _h)
+	public Quad()
+	{
+		x = 0;
+		y = 0;
+		w = 0;
+		h = 0;
+	}
+
+	public void init(int _x, int _y, int _w, int _h)
 	{
 		x = _x;
 		y = _y;
@@ -96,7 +105,7 @@ public class Quad
 	{
 		if(x == b.x && w == b.w && y + h == b.y)
 		{
-			y += b.y;
+			h += b.h;
 			return true;
 		}
 		return false;
@@ -410,12 +419,17 @@ public class Chunks
 {
 	public Voxel[,,] voxels;
 	public Mesh mesh;
-	public IndexStack<int> istack;
+	//public IndexStack<int> istack;
 
-	int[] indices;
+	//int[] indices;
 
 	public bool dirty;
+#if GREEDY_MESHING
+	public bool optimized;
+#endif
 	public uint voxel_count = 0;
+	public Vector3 wrldCoords;
+	public Vec3Int chunkCoords;
 
 	public Chunks() 
 	{
@@ -423,6 +437,9 @@ public class Chunks
 		voxels = new Voxel[chunk_size,chunk_size,chunk_size];
 
 		dirty = false;
+#if GREEDY_MESHING
+		optimized = false;
+#endif
 		float voxel_size = 1.0f / VoxelConsts.VOXEL_RES;
 
 		for (int i=0; i<chunk_size; i++)
@@ -433,12 +450,14 @@ public class Chunks
 		
 		int vertex_count = vertex_dim * vertex_dim * vertex_dim;
 	
-		indices = new int[vertex_count * 3];
-		istack = new IndexStack<int> (indices);
+		//indices = new int[vertex_count * 3];
+		//istack = new IndexStack<int> (indices);
 	}
 
-	public void init(Mesh _mesh)
+	public void init(Mesh _mesh, Vector3 wc, Vec3Int cc)
 	{
+		wrldCoords = wc;
+		chunkCoords = cc;
 		mesh = _mesh;
 		//mesh.MarkDynamic ();
 		mesh.vertices = ChunkTemplate.Instance.vertices;
@@ -554,14 +573,21 @@ public class VoxelGrid
 	void setVoxelFaces(Voxel vx, Vec3Int coords)
 	{
 		Vector3 vec = coords.ToVec3 () + new Vector3(0.5f,0.5f,0.5f);
+		Vec3Int chunkCoord = coords / (int)VoxelConsts.CHUNK_SIZE;
 		for(int i=0;i<6;i++)
 		{
 			VF flag = (VF)i;
 			vx.setFace(flag,false);
 
 			Vector3 dir = VoxelConsts.CardinalV3Dir[i];
-			
-			Voxel neighbour = getVoxel(new Vec3Int(vec + dir));
+
+			Vec3Int neighbourCoord = new Vec3Int(vec + dir);
+			//Vec3Int neighbourChunk = neighbourCoord / (int)VoxelConsts.CHUNK_SIZE;
+
+			//if(neighbourChunk != chunkCoord && voxelGrid[neighbourChunk.x, neighbourChunk.y,neighbourChunk.z] != null)
+			//	voxelGrid[neighbourChunk.x, neighbourChunk.y,neighbourChunk.z].dirty = true;
+
+			Voxel neighbour = getVoxel(neighbourCoord);
 			bool occupied = neighbour.isOccupied();
 
 			if(occupied)
@@ -579,6 +605,7 @@ public class VoxelGrid
 	void unSetVoxelFaces(Voxel vx, Vec3Int coords)
 	{
 		Vector3 vec = coords.ToVec3 () + new Vector3(0.5f,0.5f,0.5f);
+		Vec3Int chunkCoord = coords / (int)VoxelConsts.CHUNK_SIZE;
 		for(int i=0;i<6;i++)
 		{
 			VF flag = (VF)i;
@@ -586,13 +613,20 @@ public class VoxelGrid
 
 			Vector3 dir = VoxelConsts.CardinalV3Dir[i];
 
-			Voxel neighbour = getVoxel(new Vec3Int(vec + dir));
+			Vec3Int neighbourCoord = new Vec3Int(vec + dir);
+			//Vec3Int neighbourChunk = neighbourCoord / (int)VoxelConsts.CHUNK_SIZE;
+
+			Voxel neighbour = getVoxel(neighbourCoord);
 			bool occupied = neighbour.isOccupied();
 			
 			if(occupied)
 			{
 				//vx.setFace(flag,true);
 				neighbour.setFace(invertflag(flag),true);
+
+				//if(neighbourChunk != chunkCoord && voxelGrid[neighbourChunk.x, neighbourChunk.y,neighbourChunk.z] != null)
+				//	voxelGrid[neighbourChunk.x, neighbourChunk.y,neighbourChunk.z].dirty = true;
+
 			}
 		}
 	}
@@ -729,9 +763,17 @@ public class VoxelExtractionPointCloud : Singleton<VoxelExtractionPointCloud>
 	public IndexStack<Vec3Int> occupiedChunks;
 
 	Matrix4x4 MVP = Matrix4x4.identity;
+#if GREEDY_MESHING
+	Quad[,] quadpool;
+	Quad[,] quadgrid;
+	Quad[] qarray; 
+	IndexStack<Quad> qstack;
+#endif
+	
+	int[] indices;
+	IndexStack<int> istack;
 
-
-#if DEBUG_THIS
+	#if DEBUG_THIS
 	public bool fakeData;
 	public TangoPointCloud debugPtCloud;
 #endif
@@ -768,7 +810,19 @@ public class VoxelExtractionPointCloud : Singleton<VoxelExtractionPointCloud>
 			}
 
 		ChunkInstance.SetActive (false);
-		occupiedChunks = new IndexStack<Vec3Int> (new Vec3Int[1500]);
+		occupiedChunks = new IndexStack<Vec3Int> (new Vec3Int[2000]);
+
+#if GREEDY_MESHING
+		quadpool = new Quad[chunk_size, chunk_size];
+		for (int i=0; i<chunk_size; i++)
+			for (int j=0; j<chunk_size; j++)
+				quadpool [i, j] = new Quad ();
+		quadgrid = new Quad[chunk_size, chunk_size];
+		qarray = new Quad[64]; 
+		qstack = new IndexStack<Quad>(qarray);
+#endif
+		indices = new int[ChunkTemplate.Instance.vertex_count * 3];
+		istack = new IndexStack<int> (indices);
 	}
 
 	bool isInFrustum(Vector3 p, ref Matrix4x4 MVP) 
@@ -792,95 +846,7 @@ public class VoxelExtractionPointCloud : Singleton<VoxelExtractionPointCloud>
 		return false;
 	}
 #endif
-/*
-	void buildLayer(Chunks chunk, VF dir, int layer, IndexStack<Quad> stack)
-	{
-		int offset = (int)dir / 2;
-		Quad[,] quadgrid = new Quad[chunk_size, chunk_size];
 
-		for(int x=0;x<chunk_size;x++)
-			for(int y=0;y<chunk_size;y++)
-		{
-			int[] coords = new int[3];
-			coords[ (0 + offset) % 3 ] = x;
-			coords[ (1 + offset) % 3 ] = y;
-			coords[ (2 + offset) % 3 ] = layer;
-
-			Voxel vx = chunk.getVoxel(new Vec3Int(coords[0], coords[1], coords[2]));
-
-			if(vx.isOccupied() && vx.getFace(dir))
-			{
-				quadgrid[x,y] = new Quad(x,y,1,1);
-			}
-			else
-			{
-				quadgrid[x,y] = null;
-			}
-		}
-
-		//merge x
-		Quad currquad = null;
-		for(int x=0;x<chunk_size;x++)
-			for(int y=0;y<chunk_size;y++)
-		{
-			if(currquad == null)
-			{
-				if(quadgrid[x,y] == null)
-					continue;
-				else
-					currquad = quadgrid[x,y];
-			}
-			else
-			{
-				if(quadgrid[x,y] == null)
-				{
-					currquad = null;
-				}
-				else
-				{
-					currquad.mergeRight(quadgrid[x,y]);
-					quadgrid[x,y] = null;
-				}
-			}
-		}
-
-
-		//merge y
-		currquad = null;
-		for(int y=0;y<chunk_size;y++)
-			for(int x=0;x<chunk_size;x++)
-		{
-			if(currquad == null)
-			{
-				if(quadgrid[x,y] == null)
-					continue;
-				else
-					currquad = quadgrid[x,y];
-			}
-			else
-			{
-				if(quadgrid[x,y] == null)
-				{
-					currquad = null;
-				}
-				else
-				{
-					currquad.mergeUp(quadgrid[x,y]);
-					quadgrid[x,y] = null;
-				}
-			}
-		}
-
-		for(int x=0;x<chunk_size;x++)
-			for(int y=0;y<chunk_size;y++)
-		{
-			if(quadgrid[x,y] != null)
-			{
-				stack.push(quadgrid[x,y]);
-			}
-		}
-	}
-*/
 	void renderVoxelGrid()
 	{
 		
@@ -890,6 +856,7 @@ public class VoxelExtractionPointCloud : Singleton<VoxelExtractionPointCloud>
 		//for(int i=0;i<num_chunks_x;i++)
 		//	for(int j=0;j<num_chunks_y;j++)
 		//		for(int k=0;k<num_chunks_z;k++)
+		//int modcount = 0;
 		for(int i=0;i<occupiedChunks.getCount();i++)
 		{
 				Vec3Int chunkcoords = occupiedChunks.peek (i);
@@ -903,9 +870,10 @@ public class VoxelExtractionPointCloud : Singleton<VoxelExtractionPointCloud>
 					continue;
 				}
 
-				
+				//if(modcount > 20)
+				//	break;
 
-				chunk.istack.clear ();
+				istack.clear ();
 
 
 				
@@ -916,12 +884,16 @@ public class VoxelExtractionPointCloud : Singleton<VoxelExtractionPointCloud>
 				{
 					if(chunk.mesh == null)
 					{
-						chunk.init(chunkGameObjects [chunkcoords.x,chunkcoords.y,chunkcoords.z].GetComponent<MeshFilter>().mesh);
+						chunk.init(chunkGameObjects [chunkcoords.x,chunkcoords.y,chunkcoords.z].GetComponent<MeshFilter>().mesh,
+					           	   chunkGameObjects [chunkcoords.x,chunkcoords.y,chunkcoords.z].transform.position,
+					           	   chunkcoords);
 						meshrend.enabled = true;
 					}
 
 					if(meshrend.enabled == false)
 						continue;
+
+					//modcount++;
 
 					for(int x=0;x<chunk_size;x++)
 						for(int y=0;y<chunk_size;y++)
@@ -941,75 +913,92 @@ public class VoxelExtractionPointCloud : Singleton<VoxelExtractionPointCloud>
 								voxel.dcount = 0;
 							}
 #endif
+				///*
 							if(voxel.isOccupied())
 							{
 								//front
 								if(voxel.getFace(VF.VX_FRONT_SHOWN))
 								{
 									//front
-									chunk.istack.push(chunk.getIndex(x,y,z + 1) + chunk.getDirOffset(DIR.DIR_FRONT));
-									chunk.istack.push(chunk.getIndex(x + 1,y,z + 1)+ chunk.getDirOffset(DIR.DIR_FRONT));
-									chunk.istack.push(chunk.getIndex(x + 1,y + 1,z + 1)+ chunk.getDirOffset(DIR.DIR_FRONT));
-									chunk.istack.push(chunk.getIndex(x,y + 1,z + 1)+ chunk.getDirOffset(DIR.DIR_FRONT));
+									istack.push(chunk.getIndex(x,y,z + 1) + chunk.getDirOffset(DIR.DIR_FRONT));
+									istack.push(chunk.getIndex(x + 1,y,z + 1)+ chunk.getDirOffset(DIR.DIR_FRONT));
+									istack.push(chunk.getIndex(x + 1,y + 1,z + 1)+ chunk.getDirOffset(DIR.DIR_FRONT));
+									istack.push(chunk.getIndex(x,y + 1,z + 1)+ chunk.getDirOffset(DIR.DIR_FRONT));
 								}
 
 								if(voxel.getFace(VF.VX_RIGHT_SHOWN))
 								{
 									//right
-									chunk.istack.push(chunk.getIndex(x+1,y,z)+ chunk.getDirOffset(DIR.DIR_RIGHT));
-									chunk.istack.push(chunk.getIndex(x+1,y+1,z)+ chunk.getDirOffset(DIR.DIR_RIGHT));
-									chunk.istack.push(chunk.getIndex(x+1,y + 1,z + 1)+ chunk.getDirOffset(DIR.DIR_RIGHT));
-									chunk.istack.push(chunk.getIndex(x+1,y,z+1)+ chunk.getDirOffset(DIR.DIR_RIGHT));
+									istack.push(chunk.getIndex(x+1,y,z)+ chunk.getDirOffset(DIR.DIR_RIGHT));
+									istack.push(chunk.getIndex(x+1,y+1,z)+ chunk.getDirOffset(DIR.DIR_RIGHT));
+									istack.push(chunk.getIndex(x+1,y + 1,z + 1)+ chunk.getDirOffset(DIR.DIR_RIGHT));
+									istack.push(chunk.getIndex(x+1,y,z+1)+ chunk.getDirOffset(DIR.DIR_RIGHT));
 								}
 
 								if(voxel.getFace(VF.VX_BACK_SHOWN))
 								{
 									//back
-									chunk.istack.push(chunk.getIndex(x,y,z) + chunk.getDirOffset(DIR.DIR_BACK));
-									chunk.istack.push(chunk.getIndex(x,y + 1,z) + chunk.getDirOffset(DIR.DIR_BACK));
-									chunk.istack.push(chunk.getIndex(x + 1,y + 1,z) + chunk.getDirOffset(DIR.DIR_BACK));
-									chunk.istack.push(chunk.getIndex(x + 1,y,z) + chunk.getDirOffset(DIR.DIR_BACK));
+									istack.push(chunk.getIndex(x,y,z) + chunk.getDirOffset(DIR.DIR_BACK));
+									istack.push(chunk.getIndex(x,y + 1,z) + chunk.getDirOffset(DIR.DIR_BACK));
+									istack.push(chunk.getIndex(x + 1,y + 1,z) + chunk.getDirOffset(DIR.DIR_BACK));
+									istack.push(chunk.getIndex(x + 1,y,z) + chunk.getDirOffset(DIR.DIR_BACK));
 								}
 
 								if(voxel.getFace(VF.VX_LEFT_SHOWN))
 								{
 									//left
-									chunk.istack.push(chunk.getIndex(x,y,z)+ chunk.getDirOffset(DIR.DIR_LEFT));
-									chunk.istack.push(chunk.getIndex(x,y,z + 1)+ chunk.getDirOffset(DIR.DIR_LEFT));
-									chunk.istack.push(chunk.getIndex(x,y + 1,z + 1)+ chunk.getDirOffset(DIR.DIR_LEFT));
-									chunk.istack.push(chunk.getIndex(x,y + 1,z)+ chunk.getDirOffset(DIR.DIR_LEFT));
+									istack.push(chunk.getIndex(x,y,z)+ chunk.getDirOffset(DIR.DIR_LEFT));
+									istack.push(chunk.getIndex(x,y,z + 1)+ chunk.getDirOffset(DIR.DIR_LEFT));
+									istack.push(chunk.getIndex(x,y + 1,z + 1)+ chunk.getDirOffset(DIR.DIR_LEFT));
+									istack.push(chunk.getIndex(x,y + 1,z)+ chunk.getDirOffset(DIR.DIR_LEFT));
 								}
 
 								if(voxel.getFace(VF.VX_TOP_SHOWN))
 								{
 									//top
-									chunk.istack.push(chunk.getIndex(x,y+1,z)+ chunk.getDirOffset(DIR.DIR_UP));
-									chunk.istack.push(chunk.getIndex(x,y+1,z+1)+ chunk.getDirOffset(DIR.DIR_UP));
-									chunk.istack.push(chunk.getIndex(x+1,y+1,z+1)+ chunk.getDirOffset(DIR.DIR_UP));
-									chunk.istack.push(chunk.getIndex(x+1,y+1,z)+ chunk.getDirOffset(DIR.DIR_UP));
+									istack.push(chunk.getIndex(x,y+1,z)+ chunk.getDirOffset(DIR.DIR_UP));
+									istack.push(chunk.getIndex(x,y+1,z+1)+ chunk.getDirOffset(DIR.DIR_UP));
+									istack.push(chunk.getIndex(x+1,y+1,z+1)+ chunk.getDirOffset(DIR.DIR_UP));
+									istack.push(chunk.getIndex(x+1,y+1,z)+ chunk.getDirOffset(DIR.DIR_UP));
 								}
 
 								if(voxel.getFace(VF.VX_BOTTOM_SHOWN))
 								{
 									//bottom
-									chunk.istack.push(chunk.getIndex(x,y,z)+ chunk.getDirOffset(DIR.DIR_DOWN));
-									chunk.istack.push(chunk.getIndex(x+1,y,z)+ chunk.getDirOffset(DIR.DIR_DOWN));
-									chunk.istack.push(chunk.getIndex(x+1,y,z+1)+ chunk.getDirOffset(DIR.DIR_DOWN));
-									chunk.istack.push(chunk.getIndex(x,y,z+1)+ chunk.getDirOffset(DIR.DIR_DOWN));
+									istack.push(chunk.getIndex(x,y,z)+ chunk.getDirOffset(DIR.DIR_DOWN));
+									istack.push(chunk.getIndex(x+1,y,z)+ chunk.getDirOffset(DIR.DIR_DOWN));
+									istack.push(chunk.getIndex(x+1,y,z+1)+ chunk.getDirOffset(DIR.DIR_DOWN));
+									istack.push(chunk.getIndex(x,y,z+1)+ chunk.getDirOffset(DIR.DIR_DOWN));
 								}
 							}
-
+//*/
 						}
 
-					int[] indexArray = new int[chunk.istack.getCount()];
-					System.Array.Copy(chunk.istack.getArray(),indexArray,chunk.istack.getCount());
+					//buildChunk(chunk);
+					int[] indexArray = new int[istack.getCount()];
+					System.Array.Copy(istack.getArray(),indexArray,istack.getCount());
 
 					chunk.mesh.SetIndices (indexArray , MeshTopology.Quads, 0);
 					//chunk.mesh.RecalculateBounds();
 					chunk.dirty = false;
-
+				#if GREEDY_MESHING
+					chunk.optimized = false;
+#endif
 				}
-
+#if GREEDY_MESHING
+				else if(chunk.mesh != null && !chunk.optimized && chunk.voxel_count > 16)
+				{
+					if( (camera.transform.position - chunk.wrldCoords).magnitude > 40 * voxel_size )
+					{
+						buildChunk(chunk);
+						int[] indexArray = new int[istack.getCount()];
+						System.Array.Copy(istack.getArray(),indexArray,istack.getCount());
+						
+						chunk.mesh.SetIndices (indexArray , MeshTopology.Quads, 0);
+						chunk.optimized = true;
+					}
+				}
+#endif
 			}
 			framecount++;
 	}
@@ -1376,9 +1365,18 @@ public class VoxelExtractionPointCloud : Singleton<VoxelExtractionPointCloud>
 
 		}
 		
+		//renderVoxelGrid ();
+	}
+
+	void FixedUpdate() 
+	{
 		renderVoxelGrid ();
 	}
 
+	float HighResoRandom()
+	{
+		return Random.Range (-100.0f, 100.0f);
+	}
 
 	void Update()
 	{
@@ -1416,17 +1414,17 @@ public class VoxelExtractionPointCloud : Singleton<VoxelExtractionPointCloud>
 		#if DEBUG_THIS
 		if (fakeData) 
 		{
-			debugPtCloud.m_pointsCount = 100;
+			debugPtCloud.m_pointsCount = 2000;
 
 			Random.seed = (int)(Time.time * 1000) % 10;
 			
-			for(int i=0;i<10;i++)
+			for(int i=0;i<2000;i++)
 			{
-				debugPtCloud.m_points[i] = new Vector3(Random.Range (-100.0f,100.0f), Random.Range (-15.0f,15.0f), Random.Range (-100.0f,100.0f)) * 0.005f;
+				debugPtCloud.m_points[i] = new Vector3(HighResoRandom(), 0,HighResoRandom()) * 0.05f;
 			}
 
 			int count = debugPtCloud.m_pointsCount;
-			for(int i=0; i< count; i++)
+			for(int i=0; i< 2000; i++)
 			{
 				
 				Vector3 pt = debugPtCloud.m_points[i];
@@ -1447,66 +1445,185 @@ public class VoxelExtractionPointCloud : Singleton<VoxelExtractionPointCloud>
 		GUI.Label (new Rect (10,200,200,200), "Num chunks allocated: " + pool.getNumAlloced()  );
 	}
 
-	#if VOXEL_DELETION_PREV
-	bool isInDepthFrustum(Vector3 pt)
+#if GREEDY_MESHING
+	void buildLayer(Chunks chunk, VF dir, int layer, IndexStack<Quad> stack)
 	{
-		return (depthPlanes [(int)PLANES.LEFT].GetSide (pt) &&
-		        depthPlanes [(int)PLANES.RIGHT].GetSide (pt) &&
-		        depthPlanes [(int)PLANES.TOP].GetSide (pt) &&
-		        depthPlanes [(int)PLANES.BOTTOM].GetSide (pt) &&
-		        depthPlanes [(int)PLANES.FAR].GetSide (pt));
-	}
-	
-	bool isChunkInDepthFrustum(Vec3Int cc)
-	{
-		for(uint i=0;i<8;i++)
+		int offset = (int)dir / 2;
+		stack.clear ();
+
+		int count = 0;
+		for(int x=0;x<chunk_size;x++)
+			for(int y=0;y<chunk_size;y++)
 		{
-			Vec3Int corner = new Vec3Int((int)(i & 1), (int)((i & 2) >> 1), (int)((i & 4) >> 2));
-			Vec3Int point = (cc + corner) * chunk_size;
-			Vector3 wpoint = FromGrid(point);
-			if(isInDepthFrustum(wpoint))
-				return true;
+			int[] coords = new int[3];
+			coords[ (0 + offset) % 3 ] = x;
+			coords[ (1 + offset) % 3 ] = y;
+			coords[ (2 + offset) % 3 ] = layer;
+			
+			Voxel vx = chunk.getVoxel(new Vec3Int(coords[0], coords[1], coords[2]));
+			
+			if(vx.isOccupied() && vx.getFace(dir))
+			{
+				quadgrid[x,y] = quadpool[x,y];
+				quadgrid[x,y].init (x,y,1,1);
+				count++;
+			}
+			else
+			{
+				quadgrid[x,y] = null;
+			}
+		}
+
+		if (count == 0)
+			return;
+		//merge x
+		Quad currquad = null;
+		for(int y=0;y<chunk_size;y++)
+		{
+			currquad = null;
+			for(int x=0;x<chunk_size;x++)
+			{
+				if(currquad == null)
+				{
+					if(quadgrid[x,y] == null)
+						continue;
+					else
+						currquad = quadgrid[x,y];
+				}
+				else
+				{
+					if(quadgrid[x,y] == null)
+					{
+						currquad = null;
+					}
+					else
+					{
+						if(currquad.mergeRight(quadgrid[x,y]))
+							quadgrid[x,y] = null;
+					}
+				}
+			}
 		}
 		
-		return false;
+	
+		//merge y
+		currquad = null;
+		for(int x=0;x<chunk_size;x++)
+		{
+			currquad = null;
+			for(int y=0;y<chunk_size;y++)
+			{
+				if(currquad == null)
+				{
+					if(quadgrid[x,y] == null)
+						continue;
+					else
+						currquad = quadgrid[x,y];
+				}
+				else
+				{
+					if(quadgrid[x,y] == null)
+					{
+						currquad = null;
+					}
+					else
+					{
+						if(currquad.mergeUp(quadgrid[x,y]))
+							quadgrid[x,y] = null;
+						else
+							currquad = null;
+					}
+				}
+			}
+		}
+
+		for(int x=0;x<chunk_size;x++)
+			for(int y=0;y<chunk_size;y++)
+		{
+			if(quadgrid[x,y] != null)
+			{
+				stack.push(quadgrid[x,y]);
+			}
+		}
 	}
-	#endif
+	
+	void buildChunk(Chunks chunk)
+	{
+		for(int i=0;i<chunk_size;i++)
+		{
+			qstack.clear();
+			buildLayer(chunk,VF.VX_FRONT_SHOWN,i,qstack);
+			while(qstack.getCount() > 0)
+			{
+				Quad q = qstack.pop ();
+				istack.push(chunk.getIndex(q.x,		q.y,		i + 1) + chunk.getDirOffset(DIR.DIR_FRONT));
+				istack.push(chunk.getIndex(q.x + q.w,	q.y,		i + 1)+ chunk.getDirOffset(DIR.DIR_FRONT));
+				istack.push(chunk.getIndex(q.x + q.w,	q.y + q.h,	i + 1)+ chunk.getDirOffset(DIR.DIR_FRONT));
+				istack.push(chunk.getIndex(q.x,		q.y + q.h,	i + 1)+ chunk.getDirOffset(DIR.DIR_FRONT));
+			}		
+
+			qstack.clear();
+			buildLayer(chunk,VF.VX_BACK_SHOWN,i,qstack);
+			while(qstack.getCount() > 0)
+			{
+				Quad q = qstack.pop ();
+				istack.push(chunk.getIndex(q.x,		q.y,		i) + chunk.getDirOffset(DIR.DIR_BACK));
+				istack.push(chunk.getIndex(q.x,		q.y + q.h,	i) + chunk.getDirOffset(DIR.DIR_BACK));
+				istack.push(chunk.getIndex(q.x + q.w,	q.y + q.h,	i) + chunk.getDirOffset(DIR.DIR_BACK));
+				istack.push(chunk.getIndex(q.x + q.w,	q.y,		i) + chunk.getDirOffset(DIR.DIR_BACK));
+			}	
+		
+			qstack.clear();
+			buildLayer(chunk,VF.VX_RIGHT_SHOWN,i,qstack);
+			while(qstack.getCount() > 0)
+			{
+				Quad q = qstack.pop ();
+				//Debug.Log (q.x + " " + q.y + " " + q.w + " " + q.h);
+				istack.push(chunk.getIndex(i+1,	q.x,		q.y)+ chunk.getDirOffset(DIR.DIR_RIGHT));
+				istack.push(chunk.getIndex(i+1,	q.x + q.w,	q.y)+ chunk.getDirOffset(DIR.DIR_RIGHT));
+				istack.push(chunk.getIndex(i+1,	q.x + q.w,	q.y + q.h)+ chunk.getDirOffset(DIR.DIR_RIGHT));
+				istack.push(chunk.getIndex(i+1,	q.x,		q.y + q.h)+ chunk.getDirOffset(DIR.DIR_RIGHT));
+			}
+
+			qstack.clear();
+			buildLayer(chunk,VF.VX_LEFT_SHOWN,i,qstack);
+			while(qstack.getCount() > 0)
+			{
+				Quad q = qstack.pop ();
+				istack.push(chunk.getIndex(i,		q.x,		q.y)+ chunk.getDirOffset(DIR.DIR_LEFT));
+				istack.push(chunk.getIndex(i,		q.x,		q.y + q.h)+ chunk.getDirOffset(DIR.DIR_LEFT));
+				istack.push(chunk.getIndex(i,		q.x + q.w,	q.y + q.h)+ chunk.getDirOffset(DIR.DIR_LEFT));
+				istack.push(chunk.getIndex(i,		q.x + q.w,	q.y)+ chunk.getDirOffset(DIR.DIR_LEFT));
+			}
+
+			qstack.clear();
+			buildLayer(chunk,VF.VX_TOP_SHOWN,i,qstack);
+			while(qstack.getCount() > 0)
+			{
+				Quad q = qstack.pop ();
+				//Debug.Log (q.x + " " + q.y + " " + q.w + " " + q.h);
+				istack.push(chunk.getIndex(q.y,		i+1,	q.x)+ chunk.getDirOffset(DIR.DIR_UP));
+				istack.push(chunk.getIndex(q.y,		i+1,	q.x+q.w)+ chunk.getDirOffset(DIR.DIR_UP));
+				istack.push(chunk.getIndex(q.y+q.h,	i+1,	q.x+q.w)+ chunk.getDirOffset(DIR.DIR_UP));
+				istack.push(chunk.getIndex(q.y+q.h,	i+1,	q.x)+ chunk.getDirOffset(DIR.DIR_UP));
+			}
+
+			qstack.clear();
+			buildLayer(chunk,VF.VX_BOTTOM_SHOWN,i,qstack);
+			while(qstack.getCount() > 0)
+			{
+				Quad q = qstack.pop ();
+				istack.push(chunk.getIndex(q.y,		i,	q.x)+ chunk.getDirOffset(DIR.DIR_DOWN));
+				istack.push(chunk.getIndex(q.y+q.h,	i,	q.x)+ chunk.getDirOffset(DIR.DIR_DOWN));
+				istack.push(chunk.getIndex(q.y+q.h,	i,	q.x+q.w)+ chunk.getDirOffset(DIR.DIR_DOWN));
+				istack.push(chunk.getIndex(q.y,		i,	q.x+q.w)+ chunk.getDirOffset(DIR.DIR_DOWN));
+			}
+		}
+		
+	}
+#endif
 
 	
-	#if VOXEL_DELETION_PREV
-	public void computeDepthPlanes(ref Matrix4x4 mat, Vector3 depthPos, Vector3 depthMinPts, Vector3 depthMaxPts)
-	{
-		Vector3 lowerLeft = mat.MultiplyPoint(new Vector3 (depthMinPts.x, depthMinPts.y, depthMaxPts.z));
-		Vector3 upperLeft = mat.MultiplyPoint(new Vector3 (depthMinPts.x, depthMaxPts.y, depthMaxPts.z));
-		Vector3 lowerRight = mat.MultiplyPoint(new Vector3 (depthMaxPts.x, depthMinPts.y, depthMaxPts.z));
-		Vector3 upperRight = mat.MultiplyPoint(new Vector3 (depthMaxPts.x, depthMaxPts.y, depthMaxPts.z));
-		
-		///Vector3 campos = camera.transform.position;
-		
-		//depthPlanes [(int)PLANES.LEFT] = new Plane (Vector3.Cross (lowerLeft-campos,upperLeft-campos), lowerLeft);
-		//depthPlanes [(int)PLANES.RIGHT] = new Plane (Vector3.Cross (upperRight-campos,lowerRight-campos), upperRight);
-		//depthPlanes [(int)PLANES.TOP] = new Plane (Vector3.Cross (upperLeft-campos,upperRight-campos), upperLeft);
-		//depthPlanes [(int)PLANES.BOTTOM] = new Plane (Vector3.Cross (lowerRight-campos, lowerLeft-campos), lowerRight);
-		
-		Vector3 topEdge = upperRight - upperLeft;
-		Vector3 bottomEdge = lowerRight - lowerLeft;
-		Vector3 leftEdge = upperLeft - lowerLeft;
-		Vector3 rightEdge = upperRight - lowerRight;
-		
-		depthPlanes [(int)PLANES.LEFT] = new Plane (-Vector3.Cross (-camera.transform.forward,leftEdge), lowerLeft);
-		depthPlanes [(int)PLANES.RIGHT] = new Plane (-Vector3.Cross (rightEdge,-camera.transform.forward), upperRight);
-		depthPlanes [(int)PLANES.TOP] = new Plane (Vector3.Cross (topEdge, -camera.transform.forward), upperLeft);
-		depthPlanes [(int)PLANES.BOTTOM] = new Plane (Vector3.Cross (-camera.transform.forward, bottomEdge), lowerRight);
-		
-		
-		depthPlanes [(int)PLANES.FAR] = new Plane (camera.transform.forward, upperRight);
-		
-		depthCamPos = depthPos;
-		depthPlanePts [0] = lowerLeft;
-		depthPlanePts [1] = upperLeft;
-		depthPlanePts [2] = upperRight;
-		depthPlanePts [3] = lowerRight;
-	}
-	#endif
+
 	
 }
